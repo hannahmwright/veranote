@@ -84,7 +84,7 @@ class SaveTranscriptRequest(BaseModel):
 class SaveModelConfigRequest(BaseModel):
     provider: str
     model: str
-    whisperModel: str
+    whisperModel: Optional[str] = None
     apiKey: Optional[str] = None
 
 class TranscriptRequest(BaseModel):

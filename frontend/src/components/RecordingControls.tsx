@@ -3,7 +3,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { appDataDir } from '@tauri-apps/api/path';
 import { useCallback, useEffect, useState, useRef } from 'react';
-import { Play, Pause, Square, Mic } from 'lucide-react';
+import { Play, Pause, Square, Mic, MoreHorizontal } from 'lucide-react';
 import { ProcessRequest, SummaryResponse } from '@/types/summary';
 
 interface RecordingControlsProps {
@@ -12,6 +12,7 @@ interface RecordingControlsProps {
   onRecordingStop: () => void;
   onRecordingStart: () => void;
   onTranscriptReceived: (summary: SummaryResponse) => void;
+  onTranscriptionSettings?: () => void;
 }
 
 export const RecordingControls: React.FC<RecordingControlsProps> = ({
@@ -20,6 +21,7 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
   onRecordingStop,
   onRecordingStart,
   onTranscriptReceived,
+  onTranscriptionSettings,
 }) => {
   const [showPlayback, setShowPlayback] = useState(false);
   const [recordingPath, setRecordingPath] = useState<string | null>(null);
@@ -259,6 +261,22 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
                     />
                   ))}
                 </div>
+
+                {onTranscriptionSettings && (
+                  <button
+                    onClick={onTranscriptionSettings}
+                    disabled={isRecording}
+                    className={`flex items-center justify-center h-12 text-red-500 transition-colors ${
+                      isRecording 
+                        ? 'cursor-not-allowed opacity-50' 
+                        : 'hover:text-red-600 cursor-pointer'
+                    }`}
+                    title="Transcription Settings"
+                  >
+                    <span className="text-2xl font-bold leading-none">...</span>
+                  </button>
+                )}
+
               </>
             )}
           </>

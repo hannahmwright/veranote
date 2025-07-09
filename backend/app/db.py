@@ -80,13 +80,44 @@ class DatabaseManager:
                     id TEXT PRIMARY KEY,
                     provider TEXT NOT NULL,
                     model TEXT NOT NULL,
-                    whisperModel TEXT NOT NULL,
+                    whisperModel TEXT,
                     groqApiKey TEXT,
                     openaiApiKey TEXT,
                     anthropicApiKey TEXT,
                     ollamaApiKey TEXT
                 )
             """)
+            
+            # Migrate existing schema to allow NULL whisperModel
+            try:
+                cursor.execute("PRAGMA table_info(settings)")
+                columns = cursor.fetchall()
+                whisper_col = next((col for col in columns if col[1] == 'whisperModel'), None)
+                if whisper_col and whisper_col[3] == 1:  # notnull=1
+                    cursor.execute("ALTER TABLE settings RENAME TO settings_old")
+                    cursor.execute("""
+                        CREATE TABLE settings (
+                            id TEXT PRIMARY KEY,
+                            provider TEXT NOT NULL,
+                            model TEXT NOT NULL,
+                            whisperModel TEXT,
+                            groqApiKey TEXT,
+                            openaiApiKey TEXT,
+                            anthropicApiKey TEXT,
+                            ollamaApiKey TEXT,
+                            deepgram_api_key TEXT,
+                            transcription_provider TEXT DEFAULT 'whisper',
+                            enable_speaker_diarization BOOLEAN DEFAULT TRUE,
+                            deepgram_model TEXT DEFAULT 'nova-3',
+                            deepgram_language TEXT DEFAULT 'en-US'
+                        )
+                    """)
+                    cursor.execute("""
+                        INSERT INTO settings SELECT * FROM settings_old
+                    """)
+                    cursor.execute("DROP TABLE settings_old")
+            except Exception:
+                pass  # Migration not needed or already done
 
             conn.commit()
 
@@ -351,7 +382,7 @@ class DatabaseManager:
             row = await cursor.fetchone()
             return dict(zip([col[0] for col in cursor.description], row)) if row else None
 
-    async def save_model_config(self, provider: str, model: str, whisperModel: str):
+    async def save_model_config(self, provider: str, model: str, whisperModel: str = None):
         """Save the model configuration"""
         async with self._get_connection() as conn:
             # Check if the configuration already exists

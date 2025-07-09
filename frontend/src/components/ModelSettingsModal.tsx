@@ -3,7 +3,7 @@ import { useState, useEffect } from 'react';
 export interface ModelConfig {
   provider: 'ollama' | 'groq' | 'claude' | 'openai';
   model: string;
-  whisperModel: string;
+  whisperModel?: string;
   apiKey?: string | null;
 }
 

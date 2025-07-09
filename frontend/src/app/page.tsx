@@ -6,6 +6,7 @@ import { EditableTitle } from '@/components/EditableTitle';
 import { TranscriptView } from '@/components/TranscriptView';
 import { RecordingControls } from '@/components/RecordingControls';
 import { AISummary } from '@/components/AISummary';
+import { TranscriptionSettingsModal, TranscriptionConfig } from '@/components/TranscriptionSettingsModal';
 import { useSidebar } from '@/components/Sidebar/SidebarProvider';
 import { listen } from '@tauri-apps/api/event';
 import { writeTextFile } from '@tauri-apps/plugin-fs';
@@ -25,7 +26,7 @@ interface TranscriptUpdate {
 interface ModelConfig {
   provider: 'ollama' | 'groq' | 'claude';
   model: string;
-  whisperModel: string;
+  whisperModel?: string;
 }
 
 type SummaryStatus = 'idle' | 'processing' | 'summarizing' | 'regenerating' | 'completed' | 'error';
@@ -59,10 +60,17 @@ export default function Home() {
     model: 'llama3.2:latest',
     whisperModel: 'large-v3'
   });
+  const [transcriptionConfig, setTranscriptionConfig] = useState<TranscriptionConfig>({
+    provider: 'local',
+    localModel: 'large-v3',
+    cloudModel: 'base',
+    deepgramApiKey: null
+  });
   const [originalTranscript, setOriginalTranscript] = useState<string>('');
   const [models, setModels] = useState<OllamaModel[]>([]);
   const [error, setError] = useState<string>('');
   const [showModelSettings, setShowModelSettings] = useState(false);
+  const [showTranscriptionSettings, setShowTranscriptionSettings] = useState(false);
 
   const { setCurrentMeeting, setMeetings ,meetings, isMeetingActive, setIsMeetingActive} = useSidebar();
   const handleNavigation = useNavigation('', ''); // Initialize with empty values
@@ -82,6 +90,30 @@ export default function Home() {
       }));
     }
   }, [models]);
+
+  useEffect(() => {
+    const fetchConfigs = async () => {
+      try {
+        // Fetch model config
+        const modelResponse = await fetch('http://localhost:5167/get-model-config');
+        const modelData = await modelResponse.json();
+        if (modelData.provider !== null) {
+          setModelConfig(modelData);
+        }
+
+        // Fetch transcription config
+        const transcriptionResponse = await fetch('http://localhost:5167/get-transcription-config');
+        const transcriptionData = await transcriptionResponse.json();
+        if (transcriptionData.provider !== null) {
+          setTranscriptionConfig(transcriptionData);
+        }
+      } catch (error) {
+        console.error('Failed to fetch configs:', error);
+      }
+    };
+
+    fetchConfigs();
+  }, []);
 
   const whisperModels = [
     'tiny',
@@ -266,11 +298,21 @@ export default function Home() {
         return; // Just return without starting a new recording
       }
 
-      // Start new recording with whisper model
+      // Determine which transcription model to use based on transcriptionConfig
+      const transcriptionModel = transcriptionConfig.provider === 'local' 
+        ? transcriptionConfig.localModel 
+        : transcriptionConfig.cloudModel;
+
+      console.log('Starting recording with transcription config:', {
+        provider: transcriptionConfig.provider,
+        model: transcriptionModel
+      });
+
+      // Start new recording with selected transcription model
       await invoke('start_recording', {
-        args: {
-          whisper_model: modelConfig.whisperModel
-        }
+        whisper_model: transcriptionModel,
+        transcription_provider: transcriptionConfig.provider,
+        deepgram_api_key: transcriptionConfig.provider === 'cloud' ? transcriptionConfig.deepgramApiKey : null
       });
       console.log('Recording started successfully');
       setIsRecording(true);
@@ -353,7 +395,7 @@ export default function Home() {
       // Stop recording and get audio path
       await invoke('stop_recording', { 
         args: { 
-          model_config: modelConfig,
+          transcription_config: transcriptionConfig,
           save_path: audioPath
         }
       });
@@ -765,6 +807,45 @@ export default function Home() {
 
   const isSummaryLoading = summaryStatus === 'processing' || summaryStatus === 'summarizing' || summaryStatus === 'regenerating';
 
+  const handleSaveTranscriptionConfig = async (updatedConfig?: TranscriptionConfig) => {
+    try {
+      const configToSave = updatedConfig || transcriptionConfig;
+      const payload = {
+        provider: configToSave.provider,
+        localModel: configToSave.localModel,
+        cloudModel: configToSave.cloudModel,
+        deepgramApiKey: configToSave.deepgramApiKey ?? null
+      };
+      console.log('Saving transcription config with payload:', payload);
+      
+      const response = await fetch('http://localhost:5167/save-transcription-config', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload)
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        console.error('Save transcription config failed:', errorData);
+        throw new Error(errorData.error || 'Failed to save transcription config');
+      }
+
+      const responseData = await response.json();
+      console.log('Save transcription config success:', responseData);
+
+      setTranscriptionConfig(payload);
+    } catch (error) {
+      console.error('Failed to save transcription config:', error);
+      if (error instanceof Error) {
+        setError(error.message);
+      } else {
+        setError('Failed to save transcription config: Unknown error');
+      } 
+    }
+  };
+
   return (
     <div className="flex flex-col h-screen bg-gray-50">
       <div className="flex flex-1 overflow-hidden">
@@ -865,6 +946,7 @@ export default function Home() {
                 onRecordingStop={() => handleRecordingStop2(true)}
                 onRecordingStart={handleRecordingStart}
                 onTranscriptReceived={handleTranscriptUpdate}
+                onTranscriptionSettings={() => setShowTranscriptionSettings(true)}
                 barHeights={barHeights}
               />
             </div>
@@ -959,6 +1041,17 @@ export default function Home() {
                 </div>
               </div>
             </div>
+          )}
+
+          {/* Transcription Settings Modal */}
+          {showTranscriptionSettings && (
+            <TranscriptionSettingsModal
+              showTranscriptionSettings={showTranscriptionSettings}
+              setShowTranscriptionSettings={setShowTranscriptionSettings}
+              transcriptionConfig={transcriptionConfig}
+              setTranscriptionConfig={setTranscriptionConfig}
+              onSave={handleSaveTranscriptionConfig}
+            />
           )}
         </div>
 

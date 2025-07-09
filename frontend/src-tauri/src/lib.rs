@@ -38,6 +38,8 @@ struct RecordingArgs {
     save_path: String,
 }
 
+
+
 #[derive(Debug, Serialize, Clone)]
 struct TranscriptUpdate {
     text: String,
@@ -213,12 +215,42 @@ async fn send_audio_chunk(chunk: Vec<f32>, client: &reqwest::Client) -> Result<T
 }
 
 #[tauri::command]
-async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+async fn start_recording<R: Runtime>(app: AppHandle<R>, whisper_model: Option<String>) -> Result<(), String> {
     log_info!("Attempting to start recording...");
     
     if is_recording() {
         log_error!("Recording already in progress");
         return Err("Recording already in progress".to_string());
+    }
+
+    // Create HTTP client for model switching
+    let client = reqwest::Client::new();
+    
+    // Switch whisper model if specified
+    if let Some(model_name) = &whisper_model {
+        let model_path = format!("models/ggml-{}.bin", model_name);
+        log_info!("Switching to whisper model: {}", model_path);
+        
+        let form = reqwest::multipart::Form::new()
+            .text("model", model_path);
+            
+        match client.post("http://127.0.0.1:8178/load")
+            .multipart(form)
+            .send()
+            .await {
+            Ok(response) => {
+                if response.status().is_success() {
+                    log_info!("Successfully switched to model: {}", model_name);
+                } else {
+                    log_error!("Failed to switch model: HTTP {}", response.status());
+                    return Err(format!("Failed to switch to model {}", model_name));
+                }
+            },
+            Err(e) => {
+                log_error!("Failed to connect to whisper server: {}", e);
+                return Err("Whisper server not available".to_string());
+            }
+        }
     }
 
     // Initialize recording flag and buffers
@@ -268,9 +300,6 @@ async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     *MIC_STREAM.lock().unwrap() = Some(mic_stream.clone());
     *SYSTEM_STREAM.lock().unwrap() = Some(system_stream.clone());
     IS_RUNNING.store(true, Ordering::SeqCst);
-    
-    // Create HTTP client for transcription
-    let client = reqwest::Client::new();
     
     // Start transcription task
     let app_handle = app.clone();
