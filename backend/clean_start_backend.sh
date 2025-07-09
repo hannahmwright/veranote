@@ -249,8 +249,8 @@ echo -e "${GREEN}🐍 Python Backend (PID: $PYTHON_PID)${NC}"
 echo -e "${BLUE}Press Ctrl+C to stop all services${NC}"
 
 # Show whisper server port and python backend port
-echo -e "${BLUE}Whisper Server Port: $PORT${NC}"
-echo -e "${BLUE}Python Backend Port: 8178${NC}"
+echo -e "${BLUE}Whisper Server Port: 8178${NC}"
+echo -e "${BLUE}Python Backend Port: $PORT${NC}"
 
 # Keep the script running and wait for both processes
 wait $WHISPER_PID $PYTHON_PID || handle_error "One of the services crashed"

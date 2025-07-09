@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
+
 use std::{fmt, thread};
 use tokio::sync::{broadcast, oneshot};
 lazy_static! {
@@ -505,7 +506,10 @@ impl AudioStream {
                             let mono = audio_to_mono(data, channels);
                             debug!("Received audio chunk: {} samples", mono.len());
                             if let Err(e) = tx.send(mono) {
-                                error!("Failed to send audio data: {}", e);
+                                // Only log error if it's not just a closed channel (which is expected during shutdown)
+                                if !e.to_string().contains("channel closed") {
+                                    error!("Failed to send audio data: {}", e);
+                                }
                             }
                         },
                         error_callback.clone(),
@@ -525,7 +529,10 @@ impl AudioStream {
                             let mono = audio_to_mono(bytemuck::cast_slice(data), channels);
                             debug!("Received audio chunk: {} samples", mono.len());
                             if let Err(e) = tx.send(mono) {
-                                error!("Failed to send audio data: {}", e);
+                                // Only log error if it's not just a closed channel (which is expected during shutdown)
+                                if !e.to_string().contains("channel closed") {
+                                    error!("Failed to send audio data: {}", e);
+                                }
                             }
                         },
                         error_callback.clone(),
@@ -545,7 +552,10 @@ impl AudioStream {
                             let mono = audio_to_mono(bytemuck::cast_slice(data), channels);
                             debug!("Received audio chunk: {} samples", mono.len());
                             if let Err(e) = tx.send(mono) {
-                                error!("Failed to send audio data: {}", e);
+                                // Only log error if it's not just a closed channel (which is expected during shutdown)
+                                if !e.to_string().contains("channel closed") {
+                                    error!("Failed to send audio data: {}", e);
+                                }
                             }
                         },
                         error_callback.clone(),
@@ -565,7 +575,10 @@ impl AudioStream {
                             let mono = audio_to_mono(bytemuck::cast_slice(data), channels);
                             debug!("Received audio chunk: {} samples", mono.len());
                             if let Err(e) = tx.send(mono) {
-                                error!("Failed to send audio data: {}", e);
+                                // Only log error if it's not just a closed channel (which is expected during shutdown)
+                                if !e.to_string().contains("channel closed") {
+                                    error!("Failed to send audio data: {}", e);
+                                }
                             }
                         },
                         error_callback.clone(),
@@ -625,30 +638,58 @@ impl AudioStream {
     }
 
     pub async fn stop(&self) -> Result<()> {
+        // Check if already disconnected to avoid double-stopping
+        if self.is_disconnected.load(Ordering::Acquire) {
+            info!("Stream already stopped or stopping");
+            return Ok(());
+        }
+        
         // Mark as disconnected first
         self.is_disconnected.store(true, Ordering::Release);
+        info!("stopping audio stream...");
         
         // Send stop signal and wait for confirmation
         let (tx, _rx) = oneshot::channel();
-        self.stream_control.send(StreamControl::Stop(tx))?;
+        if let Err(e) = self.stream_control.send(StreamControl::Stop(tx)) {
+            // If send fails, the receiver might already be closed, which is OK
+            warn!("Failed to send stop signal (receiver may be closed): {}", e);
+        }
 
-        // Wait for thread to finish
+        // Wait for thread to finish with timeout protection
         if let Some(thread_arc) = &self.stream_thread {
             let thread_arc = thread_arc.clone();
             let thread_handle = tokio::task::spawn_blocking(move || {
                 let mut thread_guard = thread_arc.blocking_lock();
                 if let Some(join_handle) = thread_guard.take() {
-                    join_handle
-                        .join()
-                        .map_err(|_| anyhow!("failed to join stream thread"))
+                    info!("Joining audio stream thread...");
+                    match join_handle.join() {
+                        Ok(_) => {
+                            info!("Audio stream thread joined successfully");
+                            Ok(())
+                        }
+                        Err(e) => {
+                            error!("Failed to join stream thread: {:?}", e);
+                            Err(anyhow!("failed to join stream thread"))
+                        }
+                    }
                 } else {
+                    info!("Stream thread already cleaned up");
                     Ok(())
                 }
             });
 
-            thread_handle.await??;
+            // Add timeout to prevent hanging
+            match tokio::time::timeout(Duration::from_secs(5), thread_handle).await {
+                Ok(result) => {
+                    result??;
+                }
+                Err(_) => {
+                    warn!("Thread join timed out after 5 seconds, continuing cleanup");
+                }
+            }
         }
 
+        info!("audio stream stopped and cleaned up");
         Ok(())
     }
 }
