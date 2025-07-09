@@ -2,6 +2,7 @@ use std::fs;
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use std::time::Duration;
 use serde::{Deserialize, Serialize};
+use once_cell::sync::Lazy;
 
 // Declare audio module
 pub mod audio;
@@ -9,22 +10,20 @@ pub mod ollama;
 
 use audio::{
     default_input_device, default_output_device, AudioStream,
-    encode_single_audio,
 };
-use ollama::{OllamaModel};
 use tauri::{Runtime, AppHandle, Emitter};
 use log::{info as log_info, error as log_error, debug as log_debug};
 use reqwest::multipart::{Form, Part};
 
 static RECORDING_FLAG: AtomicBool = AtomicBool::new(false);
-static mut MIC_BUFFER: Option<Arc<Mutex<Vec<f32>>>> = None;
-static mut SYSTEM_BUFFER: Option<Arc<Mutex<Vec<f32>>>> = None;
-static mut MIC_STREAM: Option<Arc<AudioStream>> = None;
-static mut SYSTEM_STREAM: Option<Arc<AudioStream>> = None;
-static mut IS_RUNNING: Option<Arc<AtomicBool>> = None;
-static mut RECORDING_START_TIME: Option<std::time::Instant> = None;
+static STOPPING_FLAG: AtomicBool = AtomicBool::new(false);
 
-// Audio configuration constants
+static MIC_BUFFER: Lazy<Arc<Mutex<Vec<f32>>>> = Lazy::new(|| Arc::new(Mutex::new(Vec::new())));
+static SYSTEM_BUFFER: Lazy<Arc<Mutex<Vec<f32>>>> = Lazy::new(|| Arc::new(Mutex::new(Vec::new())));
+static MIC_STREAM: Lazy<Mutex<Option<Arc<AudioStream>>>> = Lazy::new(|| Mutex::new(None));
+static SYSTEM_STREAM: Lazy<Mutex<Option<Arc<AudioStream>>>> = Lazy::new(|| Mutex::new(None));
+static IS_RUNNING: Lazy<Arc<AtomicBool>> = Lazy::new(|| Arc::new(AtomicBool::new(false)));
+static RECORDING_START_TIME: Lazy<Mutex<Option<std::time::Instant>>> = Lazy::new(|| Mutex::new(None));
 const CHUNK_DURATION_MS: u32 = 30000; // 30 seconds per chunk for better sentence processing
 const WHISPER_SAMPLE_RATE: u32 = 16000; // Whisper's required sample rate
 const WAV_SAMPLE_RATE: u32 = 44100; // WAV file sample rate
@@ -59,7 +58,6 @@ struct TranscriptResponse {
     buffer_size_ms: i32,
 }
 
-// Helper struct to accumulate transcript segments
 #[derive(Debug)]
 struct TranscriptAccumulator {
     current_sentence: String,
@@ -228,16 +226,12 @@ async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     log_info!("Recording flag set to true");
 
     // Store recording start time
-    unsafe {
-        RECORDING_START_TIME = Some(std::time::Instant::now());
-    }
+    *RECORDING_START_TIME.lock().unwrap() = Some(std::time::Instant::now());
 
     // Initialize audio buffers
-    unsafe {
-        MIC_BUFFER = Some(Arc::new(Mutex::new(Vec::new())));
-        SYSTEM_BUFFER = Some(Arc::new(Mutex::new(Vec::new())));
-        log_info!("Initialized audio buffers");
-    }
+    MIC_BUFFER.lock().unwrap().clear();
+    SYSTEM_BUFFER.lock().unwrap().clear();
+    log_info!("Initialized audio buffers");
     
     // Get default devices
     let mic_device = Arc::new(default_input_device().map_err(|e| {
@@ -271,11 +265,9 @@ async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
         })?;
     let system_stream = Arc::new(system_stream);
 
-    unsafe {
-        MIC_STREAM = Some(mic_stream.clone());
-        SYSTEM_STREAM = Some(system_stream.clone());
-        IS_RUNNING = Some(is_running.clone());
-    }
+    *MIC_STREAM.lock().unwrap() = Some(mic_stream.clone());
+    *SYSTEM_STREAM.lock().unwrap() = Some(system_stream.clone());
+    IS_RUNNING.store(true, Ordering::SeqCst);
     
     // Create HTTP client for transcription
     let client = reqwest::Client::new();
@@ -284,8 +276,7 @@ async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     let app_handle = app.clone();
     
     // Create audio receivers
-    let mut mic_receiver = mic_stream.subscribe().await;
-    let mut mic_receiver_clone = mic_receiver.resubscribe();
+    let mut mic_receiver_clone = mic_stream.subscribe().await;
     let mut system_receiver = system_stream.subscribe().await;
     
     // Create debug directory for chunks in temp
@@ -347,12 +338,8 @@ async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
                 mic_samples.extend(chunk);
                 
                 // Store in global buffer
-                unsafe {
-                    if let Some(buffer) = &MIC_BUFFER {
-                        if let Ok(mut guard) = buffer.lock() {
-                            guard.extend(chunk_clone);
-                        }
-                    }
+                if let Ok(mut guard) = MIC_BUFFER.try_lock() {
+                    guard.extend(chunk_clone);
                 }
             }
             // If we didn't get any samples, try to resubscribe to clear any backlog
@@ -370,12 +357,8 @@ async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
                 system_samples.extend(chunk);
                 
                 // Store in global buffer
-                unsafe {
-                    if let Some(buffer) = &SYSTEM_BUFFER {
-                        if let Ok(mut guard) = buffer.lock() {
-                            guard.extend(chunk_clone);
-                        }
-                    }
+                if let Ok(mut guard) = SYSTEM_BUFFER.try_lock() {
+                    guard.extend(chunk_clone);
                 }
             }
             // If we didn't get any samples, try to resubscribe to clear any backlog
@@ -564,18 +547,25 @@ async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
 async fn stop_recording(args: RecordingArgs) -> Result<(), String> {
     log_info!("Attempting to stop recording...");
     
-    // Only check recording state if we haven't already started stopping
-    if !RECORDING_FLAG.load(Ordering::SeqCst) {
-        log_info!("Recording is already stopped");
+    if STOPPING_FLAG.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        log_info!("Stop recording already in progress, waiting for completion...");
+        while STOPPING_FLAG.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         return Ok(());
     }
-
-    // Check minimum recording duration
-    let elapsed_ms = unsafe {
-        RECORDING_START_TIME
-            .map(|start| start.elapsed().as_millis() as u64)
-            .unwrap_or(0)
-    };
+    
+    if !RECORDING_FLAG.load(Ordering::SeqCst) {
+        log_info!("Recording is already stopped");
+        STOPPING_FLAG.store(false, Ordering::SeqCst);
+        return Ok(());
+    }
+    let elapsed_ms = RECORDING_START_TIME
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|start| start.elapsed().as_millis() as u64)
+        .unwrap_or(0);
 
     if elapsed_ms < MIN_RECORDING_DURATION_MS {
         let remaining = MIN_RECORDING_DURATION_MS - elapsed_ms;
@@ -583,177 +573,110 @@ async fn stop_recording(args: RecordingArgs) -> Result<(), String> {
         tokio::time::sleep(Duration::from_millis(remaining)).await;
     }
 
-    // First set the recording flag to false to prevent new data from being processed
     RECORDING_FLAG.store(false, Ordering::SeqCst);
     log_info!("Recording flag set to false");
     
-    unsafe {
-        // Stop the running flag for audio streams first
-        if let Some(is_running) = &IS_RUNNING {
-            // Set running flag to false first to stop the tokio task
-            is_running.store(false, Ordering::SeqCst);
-            log_info!("Set recording flag to false, waiting for streams to stop...");
-            
-            // Give the tokio task time to finish and release its references
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            
-            // Stop mic stream if it exists
-            if let Some(mic_stream) = &MIC_STREAM {
-                log_info!("Stopping microphone stream...");
-                if let Err(e) = mic_stream.stop().await {
-                    log_error!("Error stopping mic stream: {}", e);
-                } else {
-                    log_info!("Microphone stream stopped successfully");
-                }
+    IS_RUNNING.store(false, Ordering::SeqCst);
+    log_info!("Set recording flag to false, waiting for streams to stop...");
+    
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    
+    let mut stop_errors = Vec::new();
+    let mic_stream_to_stop = {
+        if let Ok(mut stream_guard) = MIC_STREAM.try_lock() {
+            let stream = stream_guard.clone();
+            *stream_guard = None;
+            stream
+        } else {
+            None
+        }
+    };
+    
+    if let Some(mic_stream) = mic_stream_to_stop {
+        log_info!("Stopping microphone stream...");
+        match mic_stream.stop().await {
+            Ok(_) => log_info!("Microphone stream stopped successfully"),
+            Err(e) => {
+                let error_msg = format!("Error stopping mic stream: {}", e);
+                log_error!("{}", error_msg);
+                stop_errors.push(error_msg);
             }
-            
-            // Stop system stream if it exists
-            if let Some(system_stream) = &SYSTEM_STREAM {
-                log_info!("Stopping system stream...");
-                if let Err(e) = system_stream.stop().await {
-                    log_error!("Error stopping system stream: {}", e);
-                } else {
-                    log_info!("System stream stopped successfully");
-                }
-            }
-            
-            // Clear the stream references
-            MIC_STREAM = None;
-            SYSTEM_STREAM = None;
-            IS_RUNNING = None;
-            
-            // Give streams time to fully clean up
-            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
     
-    // Get final buffers
-    let mic_data = unsafe {
-        if let Some(buffer) = &MIC_BUFFER {
-            if let Ok(guard) = buffer.lock() {
-                guard.clone()
-            } else {
-                Vec::new()
-            }
+    let system_stream_to_stop = {
+        if let Ok(mut stream_guard) = SYSTEM_STREAM.try_lock() {
+            let stream = stream_guard.clone();
+            *stream_guard = None;
+            stream
         } else {
+            None
+        }
+    };
+    
+    if let Some(system_stream) = system_stream_to_stop {
+        log_info!("Stopping system stream...");
+        match system_stream.stop().await {
+            Ok(_) => log_info!("System stream stopped successfully"),
+            Err(e) => {
+                let error_msg = format!("Error stopping system stream: {}", e);
+                log_error!("{}", error_msg);
+                stop_errors.push(error_msg);
+            }
+        }
+    }
+    
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    
+    if !stop_errors.is_empty() {
+        log_error!("Some streams failed to stop cleanly: {:?}", stop_errors);
+    }
+    let _mic_data = match MIC_BUFFER.try_lock() {
+        Ok(guard) => guard.clone(),
+        Err(e) => {
+            log_error!("Failed to lock mic buffer during cleanup: {}", e);
             Vec::new()
         }
     };
     
-    let system_data = unsafe {
-        if let Some(buffer) = &SYSTEM_BUFFER {
-            if let Ok(guard) = buffer.lock() {
-                guard.clone()
-            } else {
-                Vec::new()
-            }
-        } else {
+    let _system_data = match SYSTEM_BUFFER.try_lock() {
+        Ok(guard) => guard.clone(),
+        Err(e) => {
+            log_error!("Failed to lock system buffer during cleanup: {}", e);
             Vec::new()
         }
     };
-    /*
-    // Mix the audio and convert to 16-bit PCM
-    let max_len = mic_data.len().max(system_data.len());
-    let mut mixed_data = Vec::with_capacity(max_len);
     
-    for i in 0..max_len {
-        let mic_sample = if i < mic_data.len() { mic_data[i] } else { 0.0 };
-        let system_sample = if i < system_data.len() { system_data[i] } else { 0.0 };
-        mixed_data.push((mic_sample + system_sample) * 0.5);
-    }
-
-    if mixed_data.is_empty() {
-        log_error!("No audio data captured");
-        return Err("No audio data captured".to_string());
-    }
-    
-    log_info!("Mixed {} audio samples", mixed_data.len());
-    
-    // Resample the audio to 16kHz for Whisper compatibility
-    let original_sample_rate = 48000; // Assuming original sample rate is 48kHz
-    if original_sample_rate != WHISPER_SAMPLE_RATE {
-        log_info!("Resampling audio from {} Hz to {} Hz for Whisper compatibility", 
-                 original_sample_rate, WHISPER_SAMPLE_RATE);
-        mixed_data = resample_audio(&mixed_data, original_sample_rate, WHISPER_SAMPLE_RATE);
-        log_info!("Resampled to {} samples", mixed_data.len());
-    }
-    
-    // Convert to 16-bit PCM samples
-    let mut bytes = Vec::with_capacity(mixed_data.len() * 2);
-    for &sample in mixed_data.iter() {
-        let value = (sample.max(-1.0).min(1.0) * 32767.0) as i16;
-        bytes.extend_from_slice(&value.to_le_bytes());
-    }
-    
-    log_info!("Converted to {} bytes of PCM data", bytes.len());
-
-    // Create WAV header
-    let data_size = bytes.len() as u32;
-    let file_size = 36 + data_size;
-    let sample_rate = WHISPER_SAMPLE_RATE; // Use Whisper's required sample rate (16000 Hz)
-    let channels = 1u16; // Mono
-    let bits_per_sample = 16u16;
-    let block_align = channels * (bits_per_sample / 8);
-    let byte_rate = sample_rate * block_align as u32;
-    
-    let mut wav_file = Vec::with_capacity(44 + bytes.len());
-    
-    // RIFF header
-    wav_file.extend_from_slice(b"RIFF");
-    wav_file.extend_from_slice(&file_size.to_le_bytes());
-    wav_file.extend_from_slice(b"WAVE");
-    
-    // fmt chunk
-    wav_file.extend_from_slice(b"fmt ");
-    wav_file.extend_from_slice(&16u32.to_le_bytes()); // fmt chunk size
-    wav_file.extend_from_slice(&1u16.to_le_bytes()); // audio format (PCM)
-    wav_file.extend_from_slice(&channels.to_le_bytes()); // num channels
-    wav_file.extend_from_slice(&sample_rate.to_le_bytes()); // sample rate
-    wav_file.extend_from_slice(&byte_rate.to_le_bytes()); // byte rate
-    wav_file.extend_from_slice(&block_align.to_le_bytes()); // block align
-    wav_file.extend_from_slice(&bits_per_sample.to_le_bytes()); // bits per sample
-    
-    // data chunk
-    wav_file.extend_from_slice(b"data");
-    wav_file.extend_from_slice(&data_size.to_le_bytes());
-    wav_file.extend_from_slice(&bytes);
-    
-    log_info!("Created WAV file with {} bytes total", wav_file.len());
-    */
-    // Create the save directory if it doesn't exist
     if let Some(parent) = std::path::Path::new(&args.save_path).parent() {
         if !parent.exists() {
             log_info!("Creating directory: {:?}", parent);
             if let Err(e) = std::fs::create_dir_all(parent) {
                 let err_msg = format!("Failed to create save directory: {}", e);
                 log_error!("{}", err_msg);
-                return Err(err_msg);
             }
         }
     }
-
-    /*
-    // Save the recording
-    log_info!("Saving recording to: {}", args.save_path);
-    match fs::write(&args.save_path, wav_file) {
-        Ok(_) => log_info!("Successfully saved recording"),
-        Err(e) => {
-            let err_msg = format!("Failed to save recording: {}", e);
-            log_error!("{}", err_msg);
-            return Err(err_msg);
-        }
-    }
-    */
     
-    // Clean up
-    unsafe {
-        MIC_BUFFER = None;
-        SYSTEM_BUFFER = None;
-        MIC_STREAM = None;
-        SYSTEM_STREAM = None;
-        IS_RUNNING = None;
-        RECORDING_START_TIME = None;
+    if let Ok(mut buffer) = MIC_BUFFER.try_lock() {
+        buffer.clear();
     }
+    if let Ok(mut buffer) = SYSTEM_BUFFER.try_lock() {
+        buffer.clear();
+    }
+    if let Ok(mut stream) = MIC_STREAM.try_lock() {
+        *stream = None;
+    }
+    if let Ok(mut stream) = SYSTEM_STREAM.try_lock() {
+        *stream = None;
+    }
+    IS_RUNNING.store(false, Ordering::SeqCst);
+    if let Ok(mut time) = RECORDING_START_TIME.try_lock() {
+        *time = None;
+    }
+    
+    log_info!("Recording stopped and cleaned up successfully");
+    
+    STOPPING_FLAG.store(false, Ordering::SeqCst);
     
     Ok(())
 }
@@ -791,7 +714,6 @@ async fn save_transcript(file_path: String, content: String) -> Result<(), Strin
     Ok(())
 }
 
-// Helper function to convert stereo to mono
 fn stereo_to_mono(stereo: &[i16]) -> Vec<i16> {
     let mut mono = Vec::with_capacity(stereo.len() / 2);
     for chunk in stereo.chunks_exact(2) {
@@ -828,7 +750,6 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
-// Helper function to resample audio
 fn resample_audio(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
     if from_rate == to_rate {
         return samples.to_vec();
@@ -847,3 +768,4 @@ fn resample_audio(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
     
     resampled
 }
+
